@@ -1,0 +1,47 @@
+name: Compilar APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: Preparar la firma de la app
+        working-directory: budget/android
+        run: |
+          echo "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" | base64 -d > app/release.jks
+          printf 'storePassword=cashew-personal-2026\nkeyPassword=cashew-personal-2026\nkeyAlias=cashewpersonal\nstoreFile=release.jks\n' > key.properties
+
+      - name: Descargar dependencias
+        working-directory: budget
+        run: flutter pub get
+
+      - name: Compilar APK
+        working-directory: budget
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Guardar el APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: cashew-apk
+          path: budget/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
