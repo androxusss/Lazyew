@@ -33,6 +33,7 @@ jobs:
           import 'dart:convert';
           import 'package:budget/colors.dart';
           import 'package:budget/database/tables.dart';
+          import 'package:budget/functions.dart';
           import 'package:budget/pages/addTransactionPage.dart';
           import 'package:budget/struct/databaseGlobal.dart';
           import 'package:budget/struct/notificationsGlobal.dart';
@@ -419,6 +420,9 @@ jobs:
           cat > lazyew_patch/lazyewPages.dart <<'LAZYEW_EOF_2'
           // Lazyew (Fork by Androxus): pantallas extra (registro de Wallet y gasto rapido).
           import 'package:budget/database/tables.dart';
+          import 'package:budget/pages/autoTransactionsPageEmail.dart';
+          import 'package:budget/struct/settings.dart';
+          import 'package:budget/widgets/settingsContainers.dart';
           import 'package:budget/struct/lazyewWallet.dart';
           import 'package:budget/widgets/globalSnackbar.dart';
           import 'package:budget/widgets/openSnackbar.dart';
@@ -493,6 +497,9 @@ jobs:
 
             @override
             Widget build(BuildContext context) {
+              final bool showTag = appStateSettings['lazyewForkTag'] != false;
+              final bool showQuick = appStateSettings['lazyewQuickEntry'] != false;
+              if (!showTag && !showQuick) return const SizedBox.shrink();
               final Color faint =
                   Theme.of(context).colorScheme.onSurface.withOpacity(0.28);
               return Padding(
@@ -501,15 +508,17 @@ jobs:
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Align(
-                      alignment: AlignmentDirectional.centerEnd,
-                      child: Text(
-                        'Fork by Androxus',
-                        style: TextStyle(fontSize: 10, color: faint),
+                    if (showTag)
+                      Align(
+                        alignment: AlignmentDirectional.centerEnd,
+                        child: Text(
+                          'Fork by Androxus',
+                          style: TextStyle(fontSize: 10, color: faint),
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 4),
-                    TextField(
+                    if (showTag && showQuick) const SizedBox(height: 4),
+                    if (showQuick)
+                      TextField(
                       controller: _controller,
                       textInputAction: TextInputAction.done,
                       onSubmitted: _submit,
@@ -661,6 +670,60 @@ jobs:
               );
             }
           }
+
+
+          // Seccion nueva de ajustes: todo lo propio de Lazyew vive aqui.
+          class LazyewSettingsSection extends StatelessWidget {
+            const LazyewSettingsSection({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return Column(
+                children: [
+                  const SettingsHeader(title: 'Lazyew'),
+                  SettingsContainerSwitch(
+                    title: 'Detectar gastos de Wallet',
+                    description: 'Registra automáticamente los pagos con Google Wallet',
+                    initialValue: appStateSettings['lazyewWalletCapture'] == true,
+                    icon: Icons.contactless_rounded,
+                    onSwitched: (value) async {
+                      await updateSettings('lazyewWalletCapture', value,
+                          updateGlobalState: false);
+                      if (value == true) {
+                        await initNotificationScanning();
+                      }
+                    },
+                  ),
+                  SettingsContainerSwitch(
+                    title: 'Gasto rápido en inicio',
+                    description: 'Campo para escribir cosas como "2500 soda"',
+                    initialValue: appStateSettings['lazyewQuickEntry'] != false,
+                    icon: Icons.bolt_rounded,
+                    onSwitched: (value) async {
+                      await updateSettings('lazyewQuickEntry', value,
+                          updateGlobalState: false);
+                    },
+                  ),
+                  SettingsContainerSwitch(
+                    title: 'Mostrar "Fork by Androxus"',
+                    description: 'Etiqueta tenue en la pantalla principal',
+                    initialValue: appStateSettings['lazyewForkTag'] != false,
+                    icon: Icons.label_outline_rounded,
+                    onSwitched: (value) async {
+                      await updateSettings('lazyewForkTag', value,
+                          updateGlobalState: false);
+                    },
+                  ),
+                  SettingsContainerOpenPage(
+                    title: 'Registro de Wallet',
+                    description: 'Texto exacto de las notificaciones detectadas',
+                    openPage: const LazyewLogPage(),
+                    icon: Icons.notifications_active_rounded,
+                  ),
+                ],
+              );
+            }
+          }
           LAZYEW_EOF_2
           cat > lazyew_patch/apply_lazyew.py <<'LAZYEW_EOF_3'
           import os, shutil, sys
@@ -679,6 +742,16 @@ jobs:
                   f.write(text.replace(old, new))
 
 
+          def rep_all(rel, old, new):
+              path = os.path.join(ROOT, rel)
+              with open(path, encoding="utf-8") as f:
+                  text = f.read()
+              if old not in text:
+                  raise SystemExit("NO SE ENCONTRO en %s: %s" % (rel, old))
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text.replace(old, new))
+
+
           shutil.copy(os.path.join(SRC, "lazyewWallet.dart"), os.path.join(ROOT, "lib/struct/lazyewWallet.dart"))
           shutil.copy(os.path.join(SRC, "lazyewPages.dart"), os.path.join(ROOT, "lib/pages/lazyewPages.dart"))
 
@@ -689,7 +762,7 @@ jobs:
 
           # 2) Ajustes por defecto
           rep("lib/struct/defaultPreferences.dart", '"notificationScanning": false,',
-              '"notificationScanning": false,\n    "lazyewWalletCapture": true,\n    "lazyewNotifLog": [],')
+              '"notificationScanning": false,\n    "lazyewWalletCapture": true,\n    "lazyewQuickEntry": true,\n    "lazyewForkTag": true,\n    "lazyewNotifLog": [],')
 
           # 3) Avisos y botones
           f = "lib/struct/initializeNotifications.dart"
@@ -718,19 +791,36 @@ jobs:
               "    'Transaction Reminders',\n    importance: Importance.max,",
               "    'Transaction Reminders',\n    actions: <AndroidNotificationAction>[\n      AndroidNotificationAction('lazyew_nothing', 'Nada hoy'),\n      AndroidNotificationAction('lazyew_register', 'Registrar',\n          showsUserInterface: true),\n    ],\n    importance: Importance.max,")
 
-          # 6) Ajustes: entrada al registro de Wallet
+          # 6) Ajustes: seccion nueva "Lazyew" y sin banner de donacion
           f = "lib/pages/settingsPage.dart"
           rep(f, "import 'package:budget/widgets/navigationFramework.dart';",
               "import 'package:budget/widgets/navigationFramework.dart';\nimport 'package:budget/pages/lazyewPages.dart';")
-          rep(f, '        appStateSettings["notificationScanningDebug"] &&\n                getPlatform(ignoreEmulation: true) == PlatformOS.isAndroid',
-              '        getPlatform(ignoreEmulation: true) == PlatformOS.isAndroid\n            ? SettingsContainerOpenPage(\n                title: "Lazyew: registro de Wallet",\n                openPage: LazyewLogPage(),\n                icon: Icons.notifications_active_rounded,\n              )\n            : SizedBox.shrink(),\n\n        appStateSettings["notificationScanningDebug"] &&\n                getPlatform(ignoreEmulation: true) == PlatformOS.isAndroid')
+          rep(f, "          Padding(\n            padding: const EdgeInsetsDirectional.only(bottom: 8.0),\n            child: PremiumBanner(),\n          ),\n          MorePages()",
+              "          LazyewSettingsSection(),\n          MorePages()")
 
           # 7) Pantalla principal: marca y gasto rapido
           f = "lib/pages/homePage/homePage.dart"
           rep(f, "import 'package:budget/widgets/navigationFramework.dart';",
               "import 'package:budget/widgets/navigationFramework.dart';\nimport 'package:budget/pages/lazyewPages.dart';")
           rep(f, "                      KeepAliveClientMixin(child: HomePageRatingBox()),",
-              "                      LazyewHomeExtras(),\n                      KeepAliveClientMixin(child: HomePageRatingBox()),")
+              "                      LazyewHomeExtras(),")
+          # 8) Sin pantallas de donacion / Pro / calificar
+          rep("lib/pages/premiumPage.dart", "bool premiumPopupEnabled = kIsWeb == false;", "bool premiumPopupEnabled = false;")
+
+          # 9) Donde decia Cashew ahora dice Lazyew
+          import glob
+          for path in glob.glob(os.path.join(ROOT, "assets/translations/generated/*.json")):
+              with open(path, encoding="utf-8") as fh:
+                  t = fh.read()
+              with open(path, "w", encoding="utf-8") as fh:
+                  fh.write(t.replace("Cashew", "Lazyew"))
+          rep_all("lib/struct/uploadAttachment.dart", 'String folderName = "Cashew";', 'String folderName = "Lazyew";')
+          rep_all("lib/pages/autoTransactionsPageEmail.dart", "Cashew", "Lazyew")
+          rep_all("lib/widgets/showChangelog.dart", "Cashew", "Lazyew")
+          rep_all("lib/widgets/accountAndBackup.dart", '"cashew-"', '"lazyew-"')
+          rep_all("lib/widgets/exportDB.dart", '"cashew-"', '"lazyew-"')
+          rep_all("lib/widgets/exportCSV.dart", '"cashew-"', '"lazyew-"')
+          rep_all("lib/widgets/importCSV.dart", '"cashew-import-template"', '"lazyew-import-template"')
           print("Lazyew aplicado correctamente")
           LAZYEW_EOF_3
           python3 lazyew_patch/apply_lazyew.py budget
