@@ -29,7 +29,7 @@ jobs:
         run: |
           mkdir -p lazyew_patch
           cat > lazyew_patch/lazyewWallet.dart <<'LAZYEW_EOF_1'
-          // Lazyew (Fork by Androxus): deteccion automatica de gastos desde Google Wallet.
+          // Lazyew (Fork by Androxus): automatic expense detection from Google Wallet.
           import 'dart:convert';
           import 'package:budget/colors.dart';
           import 'package:budget/database/tables.dart';
@@ -39,7 +39,6 @@ jobs:
           import 'package:budget/struct/notificationsGlobal.dart';
           import 'package:budget/struct/settings.dart';
           import 'package:budget/widgets/globalSnackbar.dart';
-          import 'package:budget/widgets/navigationFramework.dart';
           import 'package:budget/widgets/openSnackbar.dart';
           import 'package:budget/widgets/openPopup.dart';
           import 'package:flutter/material.dart';
@@ -47,12 +46,21 @@ jobs:
           import 'package:notification_listener_service/notification_event.dart';
 
           const String lazyewWalletPackage = 'com.google.android.apps.walletnfcrel';
-          const String lazyewUncategorizedName = 'Sin categorizar';
+          const String lazyewUncategorizedName = 'Uncategorized';
 
           class LazyewParsedExpense {
             final String merchant;
             final double amount;
-            const LazyewParsedExpense(this.merchant, this.amount);
+            final String? cardLabel;
+            final String? walletPk;
+            final String? walletName;
+            const LazyewParsedExpense(
+              this.merchant,
+              this.amount, {
+              this.cardLabel,
+              this.walletPk,
+              this.walletName,
+            });
           }
 
           bool lazyewIsWalletPackage(String? packageName) {
@@ -61,7 +69,7 @@ jobs:
             return p == lazyewWalletPackage || p.contains('wallet');
           }
 
-          // Convierte "350.00", "1,250.00", "1.250,00" o "2500" en un numero.
+          // Turns "350.00", "1,200.00", "1.250,00" or "2500" into a number.
           double? lazyewParseAmount(String raw) {
             String s = raw.trim().replaceAll(RegExp(r'[.,]+$'), '');
             if (s.isEmpty) return null;
@@ -98,45 +106,72 @@ jobs:
             return integerPart + '.' + parts[1];
           }
 
-          // Lee textos como "SINPE TP CRC350.00" (titulo y/o contenido de la notificacion).
-          LazyewParsedExpense? lazyewParseWalletText(String? title, String? content) {
-            final List<String> parts = <String>[];
-            if (title != null && title.trim().isNotEmpty) parts.add(title.trim());
-            if (content != null && content.trim().isNotEmpty) parts.add(content.trim());
-            final String full = parts.join(' ');
-            final RegExp amountRegex =
-                RegExp(r'(?:CRC|₡)\s*([0-9][0-9.,]*)', caseSensitive: false);
-            final Match? match = amountRegex.firstMatch(full);
-            if (match == null) return null;
-            final double? amount = lazyewParseAmount(match.group(1) ?? '');
-            if (amount == null || amount <= 0) return null;
-            String merchant = full.replaceFirst(match.group(0) ?? '', ' ');
-            merchant = merchant.replaceAll(
+          String _lazyewCleanText(String input) {
+            String s = input.replaceAll(
                 RegExp(r'\b(google\s+)?wallet\b', caseSensitive: false), ' ');
-            merchant = merchant.replaceAll(RegExp(r'\s+'), ' ').trim();
-            merchant = merchant
+            s = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+            s = s
                 .replaceAll(RegExp(r'^[\s\-:|,.]+'), '')
                 .replaceAll(RegExp(r'[\s\-:|,.]+$'), '')
                 .trim();
-            if (merchant.isEmpty) merchant = 'Gasto Wallet';
-            return LazyewParsedExpense(merchant, amount);
+            return s;
           }
 
-          // Lee textos escritos a mano como "2500 soda".
-          LazyewParsedExpense? lazyewParseQuickText(String text) {
-            final RegExp numberRegex = RegExp(r'(\d[\d.,]*)');
-            final Match? match = numberRegex.firstMatch(text);
+          // Reads texts like "Kiosko Universitario CRC1,200.00 with VIVE DEBITO ######".
+          LazyewParsedExpense? lazyewParseWalletText(String? title, String? content) {
+            final List<String> fields = <String>[];
+            for (final String? part in <String?>[title, content]) {
+              if (part == null) continue;
+              for (final String line in part.split('\n')) {
+                if (line.trim().isNotEmpty) fields.add(line.trim());
+              }
+            }
+            final RegExp amountRegex =
+                RegExp(r'(?:CRC|₡)\s*([0-9][0-9.,]*)', caseSensitive: false);
+            int amountField = -1;
+            Match? match;
+            for (int i = 0; i < fields.length; i++) {
+              final Match? m = amountRegex.firstMatch(fields[i]);
+              if (m != null) {
+                amountField = i;
+                match = m;
+                break;
+              }
+            }
             if (match == null) return null;
             final double? amount = lazyewParseAmount(match.group(1) ?? '');
             if (amount == null || amount <= 0) return null;
-            String title = text.replaceFirst(match.group(0) ?? '', ' ');
-            title = title.replaceAll(RegExp(r'[₡$]'), ' ');
-            title = title.replaceAll(RegExp(r'\s+'), ' ').trim();
-            if (title.isEmpty) title = 'Gasto';
-            return LazyewParsedExpense(title, amount);
+
+            final String field = fields[amountField];
+            final String before = _lazyewCleanText(field.substring(0, match.start));
+            final String after = field.substring(match.end);
+
+            String? cardLabel;
+            final Match? withMatch =
+                RegExp(r'^\s*(?:with|con)\s+(.+)$', caseSensitive: false)
+                    .firstMatch(after);
+            if (withMatch != null) {
+              final String label = (withMatch.group(1) ?? '')
+                  .replaceAll(RegExp(r'[#*•·\d\s]+$'), '')
+                  .trim();
+              if (label.isNotEmpty) cardLabel = label;
+            }
+
+            String merchant = before;
+            if (merchant.isEmpty) {
+              final List<String> others = <String>[];
+              for (int i = 0; i < fields.length; i++) {
+                if (i == amountField) continue;
+                final String cleaned = _lazyewCleanText(fields[i]);
+                if (cleaned.isNotEmpty) others.add(cleaned);
+              }
+              merchant = others.join(' ');
+            }
+            if (merchant.isEmpty) merchant = 'Wallet expense';
+            return LazyewParsedExpense(merchant, amount, cardLabel: cardLabel);
           }
 
-          // ---------------------------------------------------------------- Registro
+          // ------------------------------------------------------------------ Log
 
           List<Map<String, dynamic>> lazyewReadLog() {
             final List<Map<String, dynamic>> out = <Map<String, dynamic>>[];
@@ -175,12 +210,148 @@ jobs:
             await updateSettings('lazyewNotifLog', <String>[], updateGlobalState: false);
           }
 
-          // -------------------------------------------------------- Crear el gasto
+          // ------------------------------------------------- Cards and accounts
+
+          Map<String, String> lazyewReadCardMap() {
+            final Map<String, String> out = <String, String>{};
+            final dynamic raw = appStateSettings['lazyewCardMap'];
+            if (raw is Map) {
+              raw.forEach((dynamic k, dynamic v) {
+                out[k.toString()] = v.toString();
+              });
+            }
+            return out;
+          }
+
+          List<String> lazyewReadCardLabels() {
+            final List<String> out = <String>[];
+            final dynamic raw = appStateSettings['lazyewCardLabels'];
+            if (raw is List) {
+              for (final dynamic e in raw) {
+                out.add(e.toString());
+              }
+            }
+            return out;
+          }
+
+          Future<void> lazyewRememberCard(String label) async {
+            final List<String> labels = lazyewReadCardLabels();
+            if (!labels.contains(label)) {
+              labels.add(label);
+              await updateSettings('lazyewCardLabels', labels,
+                  updateGlobalState: false);
+            }
+          }
+
+          Future<void> lazyewSetCardAccount(String label, String? walletPk) async {
+            final Map<String, String> map = lazyewReadCardMap();
+            if (walletPk == null || walletPk.isEmpty) {
+              map.remove(label);
+            } else {
+              map[label] = walletPk;
+            }
+            await updateSettings('lazyewCardMap', map, updateGlobalState: false);
+          }
+
+          String _lazyewNorm(String s) {
+            const String from = 'áàäâãéèëêíìïîóòöôõúùüûñç';
+            const String to = 'aaaaaeeeeiiiiooooouuuunc';
+            final String lower = s.toLowerCase();
+            final StringBuffer b = StringBuffer();
+            for (final int r in lower.runes) {
+              final String ch = String.fromCharCode(r);
+              final int i = from.indexOf(ch);
+              b.write(i >= 0 ? to[i] : ch);
+            }
+            return b.toString();
+          }
+
+          Future<TransactionWallet?> _lazyewFindWallet(String? walletPk) async {
+            if (walletPk == null) return null;
+            final List<TransactionWallet> wallets =
+                await database.getAllWallets(limit: 1000);
+            for (final TransactionWallet w in wallets) {
+              if (w.walletPk == walletPk) return w;
+            }
+            return null;
+          }
+
+          // Picks the account for a Wallet card: saved choice, then a name match.
+          Future<String?> lazyewWalletForCard(String? cardLabel) async {
+            if (cardLabel == null || cardLabel.isEmpty) return null;
+            final String? saved = lazyewReadCardMap()[cardLabel];
+            if (saved != null && saved.isNotEmpty) return saved;
+            final List<TransactionWallet> wallets =
+                await database.getAllWallets(limit: 1000);
+            final String normLabel = _lazyewNorm(cardLabel);
+            for (final TransactionWallet w in wallets) {
+              final String n = _lazyewNorm(w.name.trim());
+              if (n.isNotEmpty && normLabel.contains(n)) return w.walletPk;
+            }
+            return null;
+          }
+
+          // Reads quick text like "2500 soda BAC" or "BCR 3200 Fitos".
+          // An account name anywhere in the text picks that account (the last one
+          // mentioned wins). With no account name the default account is used.
+          Future<LazyewParsedExpense?> lazyewParseQuick(String text) async {
+            final Match? match = RegExp(r'(\d[\d.,]*)').firstMatch(text);
+            if (match == null) return null;
+            final double? amount = lazyewParseAmount(match.group(1) ?? '');
+            if (amount == null || amount <= 0) return null;
+            String remainder = text.replaceRange(match.start, match.end, ' ');
+            remainder = remainder.replaceAll(RegExp(r'[₡$]'), ' ');
+
+            String? walletPk;
+            String? walletName;
+            try {
+              final List<TransactionWallet> wallets =
+                  await database.getAllWallets(limit: 1000);
+              final String norm = _lazyewNorm(remainder);
+              if (norm.length == remainder.length) {
+                int bestStart = -1;
+                int bestLength = 0;
+                TransactionWallet? best;
+                for (final TransactionWallet w in wallets) {
+                  final String n = _lazyewNorm(w.name.trim());
+                  if (n.isEmpty) continue;
+                  final RegExp r =
+                      RegExp(r'(?<![a-z0-9])' + RegExp.escape(n) + r'(?![a-z0-9])');
+                  for (final Match wm in r.allMatches(norm)) {
+                    if (wm.start > bestStart ||
+                        (wm.start == bestStart && n.length > bestLength)) {
+                      bestStart = wm.start;
+                      bestLength = n.length;
+                      best = w;
+                    }
+                  }
+                }
+                if (best != null) {
+                  walletPk = best.walletPk;
+                  walletName = best.name;
+                  remainder =
+                      remainder.replaceRange(bestStart, bestStart + bestLength, ' ');
+                }
+              }
+            } catch (_) {}
+
+            String title = remainder.replaceAll(RegExp(r'\s+'), ' ').trim();
+            title = title
+                .replaceAll(RegExp(r'^[\s\-:|,.]+'), '')
+                .replaceAll(RegExp(r'[\s\-:|,.]+$'), '')
+                .trim();
+            if (title.isEmpty) title = 'Expense';
+            return LazyewParsedExpense(title, amount,
+                walletPk: walletPk, walletName: walletName);
+          }
+
+          // ---------------------------------------------------- Create the expense
 
           Future<TransactionCategory> _lazyewUncategorizedCategory() async {
             List<TransactionCategory> all = await database.getAllCategories(limit: 1000);
             for (final TransactionCategory c in all) {
-              if (c.name.trim().toLowerCase() == lazyewUncategorizedName.toLowerCase()) {
+              final String n = c.name.trim().toLowerCase();
+              if (n == lazyewUncategorizedName.toLowerCase() || n == 'sin categorizar') {
                 return c;
               }
             }
@@ -212,11 +383,13 @@ jobs:
             return c?.name ?? '';
           }
 
-          // Crea un gasto (monto positivo en [amount]) y le busca categoria por nombre.
+          // Creates an expense ([amount] is positive) and looks up its category by name.
           Future<Transaction?> lazyewCreateExpense({
             required String title,
             required double amount,
             String note = '',
+            String? walletPk,
+            DateTime? date,
           }) async {
             TransactionCategory? found;
             try {
@@ -245,8 +418,8 @@ jobs:
                 note: note,
                 categoryFk: categoryPk,
                 subCategoryFk: subCategoryPk,
-                walletFk: appStateSettings['selectedWalletPk'],
-                dateCreated: DateTime.now(),
+                walletFk: walletPk ?? appStateSettings['selectedWalletPk'],
+                dateCreated: date ?? DateTime.now(),
                 income: false,
                 paid: true,
                 skipPaid: false,
@@ -258,7 +431,75 @@ jobs:
             return await database.getTransactionFromRowId(rowId);
           }
 
-          // ------------------------------------------------- Aviso con tres botones
+          // ---------------------------------- Expenses typed in the home screen widget
+
+          bool _lazyewDraining = false;
+
+          // The widget saves the typed text natively; the app imports it here.
+          Future<List<String>> lazyewDrainPendingQuickAdds() async {
+            final List<String> summaries = <String>[];
+            if (_lazyewDraining) return summaries;
+            _lazyewDraining = true;
+            try {
+              await sharedPreferences.reload();
+              final String? raw = sharedPreferences.getString('lazyew_pending');
+              if (raw == null || raw.trim().isEmpty || raw.trim() == '[]') {
+                return summaries;
+              }
+              final dynamic decoded = json.decode(raw);
+              await sharedPreferences.setString('lazyew_pending', '[]');
+              if (decoded is! List) return summaries;
+              for (final dynamic item in decoded) {
+                if (item is! Map) continue;
+                final String text = (item['text'] ?? '').toString();
+                DateTime? when;
+                final dynamic ms = item['time'];
+                if (ms is num) {
+                  when = DateTime.fromMillisecondsSinceEpoch(ms.toInt());
+                }
+                final Map<String, dynamic> entry = <String, dynamic>{
+                  'time': DateTime.now().toIso8601String(),
+                  'package': 'home screen widget',
+                  'title': '',
+                  'content': text,
+                  'removed': false,
+                  'result': '',
+                };
+                try {
+                  final LazyewParsedExpense? parsed = await lazyewParseQuick(text);
+                  if (parsed == null) {
+                    entry['result'] = 'Ignored: no amount found';
+                  } else {
+                    final Transaction? t = await lazyewCreateExpense(
+                      title: parsed.merchant,
+                      amount: parsed.amount,
+                      note: 'Added from widget',
+                      walletPk: parsed.walletPk,
+                      date: when,
+                    );
+                    if (t == null) {
+                      entry['result'] = 'Error: could not save the expense';
+                    } else {
+                      entry['result'] = 'Expense created: ' +
+                          parsed.merchant +
+                          ' / ' +
+                          parsed.amount.toString();
+                      summaries.add(parsed.merchant + ' ₡' + lazyewFormatAmount(parsed.amount));
+                    }
+                  }
+                } catch (e) {
+                  entry['result'] = 'Error: ' + e.toString();
+                }
+                await lazyewAddLog(entry);
+              }
+            } catch (_) {
+            } finally {
+              _lazyewDraining = false;
+            }
+            return summaries;
+          }
+
+          // -------------------------------------------- Notification with 3 buttons
 
           Future<void> lazyewRequestNotificationPermission() async {
             try {
@@ -270,33 +511,37 @@ jobs:
           }
 
           Future<void> lazyewShowDetectedNotification(
-              Transaction t, String categoryName) async {
+              Transaction t, String categoryName, String? walletName) async {
             final AndroidNotificationDetails details = AndroidNotificationDetails(
               'lazyewDetected',
-              'Gastos detectados',
-              channelDescription: 'Avisos de gastos detectados automaticamente',
+              'Detected expenses',
+              channelDescription: 'Alerts for expenses detected automatically',
               importance: Importance.high,
               priority: Priority.high,
               actions: <AndroidNotificationAction>[
                 AndroidNotificationAction('lazyew_ok', 'Ok!'),
-                AndroidNotificationAction('lazyew_edit', 'Editar',
+                AndroidNotificationAction('lazyew_edit', 'Edit',
                     showsUserInterface: true),
-                AndroidNotificationAction('lazyew_delete', 'Eliminar',
+                AndroidNotificationAction('lazyew_delete', 'Delete',
                     showsUserInterface: true),
               ],
             );
+            String body = t.name + '  →  ' + categoryName;
+            if (walletName != null && walletName.isNotEmpty) {
+              body = body + '  ·  ' + walletName;
+            }
             final int notificationId =
                 1000 + ((DateTime.now().millisecondsSinceEpoch ~/ 1000) % 1000000);
             await flutterLocalNotificationsPlugin.show(
               notificationId,
-              'Gasto detectado: ₡' + lazyewFormatAmount(t.amount.abs()),
-              t.name + '  →  ' + categoryName,
+              'Expense detected: ₡' + lazyewFormatAmount(t.amount.abs()),
+              body,
               NotificationDetails(android: details),
               payload: 'lazyew?transactionPk=' + t.transactionPk,
             );
           }
 
-          // Agrega la accion tocada (editar / eliminar) al texto del payload.
+          // Adds the tapped action (edit / delete) to the payload text.
           String? lazyewPayloadWithAction(String? payload, String? actionId) {
             if (payload == null || !payload.startsWith('lazyew?')) return payload;
             final String action = actionId == 'lazyew_delete' ? 'delete' : 'edit';
@@ -314,7 +559,7 @@ jobs:
               transaction = await database.getTransactionFromPk(pk);
             } catch (_) {
               openSnackbar(SnackbarMessage(
-                title: 'Ese gasto ya no existe',
+                title: 'That expense no longer exists',
                 icon: Icons.info_outline_rounded,
               ));
               return true;
@@ -322,7 +567,7 @@ jobs:
             if (action == 'delete') {
               await database.deleteTransaction(pk);
               openSnackbar(SnackbarMessage(
-                title: 'Gasto eliminado',
+                title: 'Expense deleted',
                 description: transaction.name,
                 icon: Icons.delete_outline_rounded,
               ));
@@ -338,12 +583,12 @@ jobs:
             return true;
           }
 
-          // -------------------------------------------- Entrada principal (Wallet)
+          // --------------------------------------------- Main entry (Wallet events)
 
           DateTime? _lazyewLastTime;
           String? _lazyewLastKey;
 
-          // Devuelve true si la notificacion fue de Wallet y ya se manejo aqui.
+          // Returns true if the notification came from Wallet and was handled here.
           Future<bool> lazyewHandleNotificationEvent(
               ServiceNotificationEvent event) async {
             if (appStateSettings['lazyewWalletCapture'] != true) return false;
@@ -364,51 +609,67 @@ jobs:
 
             try {
               if (!isWallet) {
-                entry['result'] = 'Ignorado: no es de Wallet';
+                entry['result'] = 'Ignored: not from Wallet';
                 await lazyewAddLog(entry);
                 return false;
               }
               if (event.hasRemoved == true) {
-                entry['result'] = 'Ignorado: aviso de notificacion descartada';
+                entry['result'] = 'Ignored: notification dismissed event';
                 await lazyewAddLog(entry);
                 return true;
               }
               if (parsed == null) {
-                entry['result'] = 'Ignorado: no se encontro monto CRC';
+                entry['result'] = 'Ignored: no CRC amount found';
                 await lazyewAddLog(entry);
                 return true;
               }
-              final String key = parsed.merchant + '|' + parsed.amount.toString();
+              final String key = parsed.merchant +
+                  '|' +
+                  parsed.amount.toString() +
+                  '|' +
+                  (parsed.cardLabel ?? '');
               final DateTime now = DateTime.now();
               if (_lazyewLastKey == key &&
                   _lazyewLastTime != null &&
                   now.difference(_lazyewLastTime!).inSeconds < 30) {
-                entry['result'] = 'Ignorado: duplicado';
+                entry['result'] = 'Ignored: duplicate';
                 await lazyewAddLog(entry);
                 return true;
               }
               _lazyewLastKey = key;
               _lazyewLastTime = now;
 
+              if (parsed.cardLabel != null) {
+                await lazyewRememberCard(parsed.cardLabel!);
+              }
+              final String? walletPk = await lazyewWalletForCard(parsed.cardLabel);
+
               final Transaction? t = await lazyewCreateExpense(
                 title: parsed.merchant,
                 amount: parsed.amount,
-                note: 'Detectado desde Wallet',
+                note: 'Detected from Wallet' +
+                    (parsed.cardLabel != null ? ' (' + parsed.cardLabel! + ')' : ''),
+                walletPk: walletPk,
               );
               if (t == null) {
-                entry['result'] = 'Error: no se pudo guardar el gasto';
+                entry['result'] = 'Error: could not save the expense';
                 await lazyewAddLog(entry);
                 return true;
               }
               final String categoryName = await lazyewCategoryName(t.categoryFk);
-              entry['result'] = 'Gasto creado: ' +
+              final TransactionWallet? wallet = await _lazyewFindWallet(t.walletFk);
+              entry['result'] = 'Expense created: ' +
                   parsed.merchant +
                   ' / CRC ' +
                   parsed.amount.toString() +
                   ' / ' +
-                  categoryName;
+                  categoryName +
+                  ' / card: ' +
+                  (parsed.cardLabel ?? 'none') +
+                  ' / account: ' +
+                  (wallet?.name ?? 'default');
               await lazyewAddLog(entry);
-              await lazyewShowDetectedNotification(t, categoryName);
+              await lazyewShowDetectedNotification(t, categoryName, wallet?.name);
             } catch (e) {
               entry['result'] = 'Error: ' + e.toString();
               try {
@@ -419,19 +680,21 @@ jobs:
           }
           LAZYEW_EOF_1
           cat > lazyew_patch/lazyewPages.dart <<'LAZYEW_EOF_2'
-          // Lazyew (Fork by Androxus): pantallas extra (registro de Wallet y gasto rapido).
+          // Lazyew (Fork by Androxus): extra screens (Wallet log, quick add, settings).
           import 'package:budget/database/tables.dart';
           import 'package:budget/pages/autoTransactionsPageEmail.dart';
-          import 'package:budget/struct/settings.dart';
-          import 'package:budget/widgets/settingsContainers.dart';
+          import 'package:budget/pages/editHomePage.dart';
+          import 'package:budget/struct/databaseGlobal.dart';
           import 'package:budget/struct/lazyewWallet.dart';
+          import 'package:budget/struct/settings.dart';
           import 'package:budget/widgets/globalSnackbar.dart';
           import 'package:budget/widgets/openSnackbar.dart';
+          import 'package:budget/widgets/settingsContainers.dart';
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
           import 'package:notification_listener_service/notification_listener_service.dart';
 
-          // Etiqueta discreta "Fork by Androxus" + campo de gasto rapido ("2500 soda").
+          // Subtle "Fork by Androxus" tag + quick add field ("2500 soda BAC").
           class LazyewHomeExtras extends StatefulWidget {
             const LazyewHomeExtras({super.key});
 
@@ -439,23 +702,55 @@ jobs:
             State<LazyewHomeExtras> createState() => _LazyewHomeExtrasState();
           }
 
-          class _LazyewHomeExtrasState extends State<LazyewHomeExtras> {
+          class _LazyewHomeExtrasState extends State<LazyewHomeExtras>
+              with WidgetsBindingObserver {
             final TextEditingController _controller = TextEditingController();
             bool _busy = false;
 
             @override
+            void initState() {
+              super.initState();
+              WidgetsBinding.instance.addObserver(this);
+              _importWidgetExpenses();
+            }
+
+            @override
             void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
               _controller.dispose();
               super.dispose();
             }
 
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState state) {
+              if (state == AppLifecycleState.resumed) {
+                _importWidgetExpenses();
+              }
+            }
+
+            // Imports expenses typed in the home screen widget while the app was closed.
+            Future<void> _importWidgetExpenses() async {
+              try {
+                final List<String> added = await lazyewDrainPendingQuickAdds();
+                if (added.isNotEmpty) {
+                  openSnackbar(SnackbarMessage(
+                    title: 'Added ' +
+                        added.length.toString() +
+                        ' expense(s) from the widget',
+                    description: added.take(3).join(', '),
+                    icon: Icons.check_circle_outline_rounded,
+                  ));
+                }
+              } catch (_) {}
+            }
+
             Future<void> _submit(String value) async {
               if (_busy) return;
-              final LazyewParsedExpense? parsed = lazyewParseQuickText(value);
+              final LazyewParsedExpense? parsed = await lazyewParseQuick(value);
               if (parsed == null) {
                 openSnackbar(SnackbarMessage(
-                  title: 'Escribe monto y detalle',
-                  description: 'Ejemplo: 2500 soda',
+                  title: 'Type an amount and a description',
+                  description: 'Example: 2500 soda BAC',
                   icon: Icons.info_outline_rounded,
                 ));
                 return;
@@ -467,24 +762,29 @@ jobs:
                 final Transaction? t = await lazyewCreateExpense(
                   title: parsed.merchant,
                   amount: parsed.amount,
+                  walletPk: parsed.walletPk,
                 );
                 if (t != null) {
                   final String categoryName = await lazyewCategoryName(t.categoryFk);
                   _controller.clear();
                   FocusManager.instance.primaryFocus?.unfocus();
+                  String description = parsed.merchant +
+                      ' · ₡' +
+                      lazyewFormatAmount(parsed.amount) +
+                      '  →  ' +
+                      categoryName;
+                  if (parsed.walletName != null) {
+                    description = description + '  ·  ' + parsed.walletName!;
+                  }
                   openSnackbar(SnackbarMessage(
-                    title: 'Gasto registrado',
-                    description: parsed.merchant +
-                        ' · ₡' +
-                        lazyewFormatAmount(parsed.amount) +
-                        '  →  ' +
-                        categoryName,
+                    title: 'Expense added',
+                    description: description,
                     icon: Icons.check_circle_outline_rounded,
                   ));
                 }
               } catch (e) {
                 openSnackbar(SnackbarMessage(
-                  title: 'No se pudo registrar',
+                  title: 'Could not add the expense',
                   description: e.toString(),
                   icon: Icons.warning_amber_rounded,
                 ));
@@ -520,31 +820,66 @@ jobs:
                     if (showTag && showQuick) const SizedBox(height: 4),
                     if (showQuick)
                       TextField(
-                      controller: _controller,
-                      textInputAction: TextInputAction.done,
-                      onSubmitted: _submit,
-                      decoration: InputDecoration(
-                        isDense: true,
-                        hintText: 'Gasto rápido: 2500 soda',
-                        prefixIcon: const Icon(Icons.bolt_rounded),
-                        suffixIcon: IconButton(
-                          icon: const Icon(Icons.send_rounded),
-                          onPressed: () {
-                            _submit(_controller.text);
-                          },
-                        ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(15),
+                        controller: _controller,
+                        textInputAction: TextInputAction.done,
+                        onSubmitted: _submit,
+                        decoration: InputDecoration(
+                          isDense: true,
+                          hintText: 'Quick add: 2500 soda BAC',
+                          prefixIcon: const Icon(Icons.bolt_rounded),
+                          suffixIcon: IconButton(
+                            icon: const Icon(Icons.send_rounded),
+                            onPressed: () {
+                              _submit(_controller.text);
+                            },
+                          ),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(15),
+                          ),
                         ),
                       ),
-                    ),
                   ],
                 ),
               );
             }
           }
 
-          // Pantalla de diagnostico: muestra el texto exacto de cada notificacion de Wallet.
+          // Row shown in "Edit Home" to turn the quick add field on or off.
+          class LazyewEditHomeQuickAddRow extends StatefulWidget {
+            const LazyewEditHomeQuickAddRow({super.key});
+
+            @override
+            State<LazyewEditHomeQuickAddRow> createState() =>
+                _LazyewEditHomeQuickAddRowState();
+          }
+
+          class _LazyewEditHomeQuickAddRowState extends State<LazyewEditHomeQuickAddRow> {
+            late bool value = appStateSettings['lazyewQuickEntry'] != false;
+
+            @override
+            Widget build(BuildContext context) {
+              return HomePageEditRowEntry(
+                canReorder: false,
+                text: 'Quick add (Lazyew)',
+                iconData: Icons.bolt_rounded,
+                toggleSwitch: () {
+                  final bool newValue = !value;
+                  updateSettings('lazyewQuickEntry', newValue,
+                      pagesNeedingRefresh: [0], updateGlobalState: false);
+                  setState(() {
+                    value = newValue;
+                  });
+                },
+                switchValue: value,
+                currentReorder: false,
+                onTap: null,
+                extraWidgetsBelow: null,
+                index: 0,
+              );
+            }
+          }
+
+          // Diagnostic screen: shows the exact text of every Wallet notification seen.
           class LazyewLogPage extends StatefulWidget {
             const LazyewLogPage({super.key});
 
@@ -574,17 +909,17 @@ jobs:
             }
 
             String _entryToText(Map<String, dynamic> e) {
-              return 'Hora: ' +
+              return 'Time: ' +
                   (e['time'] ?? '').toString() +
-                  '\nApp (paquete): ' +
+                  '\nApp (package): ' +
                   (e['package'] ?? '').toString() +
-                  '\nTitulo: ' +
+                  '\nTitle: ' +
                   (e['title'] ?? '').toString() +
-                  '\nTexto: ' +
+                  '\nText: ' +
                   (e['content'] ?? '').toString() +
-                  '\nEliminada: ' +
+                  '\nRemoved: ' +
                   (e['removed'] ?? '').toString() +
-                  '\nResultado: ' +
+                  '\nResult: ' +
                   (e['result'] ?? '').toString();
             }
 
@@ -594,23 +929,24 @@ jobs:
               final bool hasAccess = _hasAccess == true;
               return Scaffold(
                 appBar: AppBar(
-                  title: const Text('Registro de Wallet'),
+                  title: const Text('Wallet log'),
                   actions: [
                     IconButton(
-                      tooltip: 'Copiar todo',
+                      tooltip: 'Copy all',
                       icon: const Icon(Icons.copy_rounded),
                       onPressed: () async {
-                        final String all = entries.map(_entryToText).join('\n\n-----\n\n');
+                        final String all =
+                            entries.map(_entryToText).join('\n\n-----\n\n');
                         await Clipboard.setData(ClipboardData(text: all));
                         openSnackbar(SnackbarMessage(
-                          title: 'Copiado',
-                          description: 'Pega el texto en el chat con Claude',
+                          title: 'Copied',
+                          description: 'Paste the text in your chat with Claude',
                           icon: Icons.copy_rounded,
                         ));
                       },
                     ),
                     IconButton(
-                      tooltip: 'Borrar registro',
+                      tooltip: 'Clear log',
                       icon: const Icon(Icons.delete_outline_rounded),
                       onPressed: () async {
                         await lazyewClearLog();
@@ -630,11 +966,11 @@ jobs:
                               : Icons.error_outline_rounded,
                         ),
                         title: Text(hasAccess
-                            ? 'Acceso a notificaciones: ACTIVO'
-                            : 'Acceso a notificaciones: FALTA'),
+                            ? 'Notification access: ON'
+                            : 'Notification access: MISSING'),
                         subtitle: Text(hasAccess
-                            ? 'Lazyew puede leer los avisos de Wallet.'
-                            : 'Toca aquí para dar el permiso a Lazyew.'),
+                            ? 'Lazyew can read Wallet notifications.'
+                            : 'Tap here to give Lazyew the permission.'),
                         onTap: () async {
                           if (!hasAccess) {
                             await NotificationListenerService.requestPermission();
@@ -646,15 +982,15 @@ jobs:
                     const Padding(
                       padding: EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                       child: Text(
-                        'Aquí aparece cada notificación de Wallet que Lazyew ve, con su '
-                        'texto exacto. Mantén Lazyew abierta o en las apps recientes.',
+                        'Every Wallet notification Lazyew sees appears here with its '
+                        'exact text. Keep Lazyew open or in your recent apps.',
                         style: TextStyle(fontSize: 12),
                       ),
                     ),
                     if (entries.isEmpty)
                       const Padding(
                         padding: EdgeInsets.all(24),
-                        child: Center(child: Text('Todavía no hay notificaciones.')),
+                        child: Center(child: Text('No notifications yet.')),
                       ),
                     for (final Map<String, dynamic> e in entries)
                       Card(
@@ -672,8 +1008,81 @@ jobs:
             }
           }
 
+          // Choose which account each Wallet card charges.
+          class LazyewCardsPage extends StatefulWidget {
+            const LazyewCardsPage({super.key});
 
-          // Seccion nueva de ajustes: todo lo propio de Lazyew vive aqui.
+            @override
+            State<LazyewCardsPage> createState() => _LazyewCardsPageState();
+          }
+
+          class _LazyewCardsPageState extends State<LazyewCardsPage> {
+            @override
+            Widget build(BuildContext context) {
+              final List<String> labels = lazyewReadCardLabels();
+              final Map<String, String> map = lazyewReadCardMap();
+              return Scaffold(
+                appBar: AppBar(title: const Text('Cards & accounts')),
+                body: FutureBuilder<List<TransactionWallet>>(
+                  future: database.getAllWallets(limit: 1000),
+                  builder: (BuildContext context,
+                      AsyncSnapshot<List<TransactionWallet>> snapshot) {
+                    final List<TransactionWallet> wallets =
+                        snapshot.data ?? <TransactionWallet>[];
+                    return ListView(
+                      padding: const EdgeInsets.all(12),
+                      children: [
+                        const Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                          child: Text(
+                            'Choose which account each Wallet card charges. Cards show '
+                            'up here after Lazyew sees a payment made with them. '
+                            'Without a choice, Lazyew looks for an account whose name '
+                            'is inside the card name, then uses your default account.',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                        if (labels.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.all(24),
+                            child: Center(child: Text('No cards seen yet.')),
+                          ),
+                        for (final String label in labels)
+                          Card(
+                            child: ListTile(
+                              title: Text(label),
+                              trailing: DropdownButton<String>(
+                                value: wallets.any((TransactionWallet w) =>
+                                        w.walletPk == map[label])
+                                    ? map[label]
+                                    : '',
+                                items: [
+                                  const DropdownMenuItem<String>(
+                                    value: '',
+                                    child: Text('Automatic'),
+                                  ),
+                                  for (final TransactionWallet w in wallets)
+                                    DropdownMenuItem<String>(
+                                      value: w.walletPk,
+                                      child: Text(w.name),
+                                    ),
+                                ],
+                                onChanged: (String? newValue) async {
+                                  await lazyewSetCardAccount(label, newValue);
+                                  if (mounted) setState(() {});
+                                },
+                              ),
+                            ),
+                          ),
+                      ],
+                    );
+                  },
+                ),
+              );
+            }
+          }
+
+          // New settings section: everything specific to Lazyew lives here.
           class LazyewSettingsSection extends StatelessWidget {
             const LazyewSettingsSection({super.key});
 
@@ -683,8 +1092,8 @@ jobs:
                 children: [
                   const SettingsHeader(title: 'Lazyew'),
                   SettingsContainerSwitch(
-                    title: 'Detectar gastos de Wallet',
-                    description: 'Registra automáticamente los pagos con Google Wallet',
+                    title: 'Detect Wallet expenses',
+                    description: 'Automatically record Google Wallet payments',
                     initialValue: appStateSettings['lazyewWalletCapture'] == true,
                     icon: Icons.contactless_rounded,
                     onSwitched: (value) async {
@@ -695,19 +1104,21 @@ jobs:
                       }
                     },
                   ),
-                  SettingsContainerSwitch(
-                    title: 'Gasto rápido en inicio',
-                    description: 'Campo para escribir cosas como "2500 soda"',
-                    initialValue: appStateSettings['lazyewQuickEntry'] != false,
-                    icon: Icons.bolt_rounded,
-                    onSwitched: (value) async {
-                      await updateSettings('lazyewQuickEntry', value,
-                          updateGlobalState: false);
-                    },
+                  SettingsContainerOpenPage(
+                    title: 'Cards & accounts',
+                    description: 'Choose the account each Wallet card charges',
+                    openPage: const LazyewCardsPage(),
+                    icon: Icons.credit_card_rounded,
+                  ),
+                  SettingsContainerOpenPage(
+                    title: 'Wallet log',
+                    description: 'Exact text of the detected notifications',
+                    openPage: const LazyewLogPage(),
+                    icon: Icons.notifications_active_rounded,
                   ),
                   SettingsContainerSwitch(
-                    title: 'Mostrar "Fork by Androxus"',
-                    description: 'Etiqueta tenue en la pantalla principal',
+                    title: 'Show "Fork by Androxus"',
+                    description: 'Faint tag on the home screen',
                     initialValue: appStateSettings['lazyewForkTag'] != false,
                     icon: Icons.label_outline_rounded,
                     onSwitched: (value) async {
@@ -715,18 +1126,232 @@ jobs:
                           updateGlobalState: false);
                     },
                   ),
-                  SettingsContainerOpenPage(
-                    title: 'Registro de Wallet',
-                    description: 'Texto exacto de las notificaciones detectadas',
-                    openPage: const LazyewLogPage(),
-                    icon: Icons.notifications_active_rounded,
-                  ),
                 ],
               );
             }
           }
           LAZYEW_EOF_2
-          cat > lazyew_patch/apply_lazyew.py <<'LAZYEW_EOF_3'
+          cat > lazyew_patch/LazyewQuickWidgetProvider.java <<'LAZYEW_EOF_3'
+          package com.budget.tracker_app;
+
+          import android.app.PendingIntent;
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.widget.RemoteViews;
+
+          // Lazyew quick add widget: tapping it opens a small popup to type an expense.
+          public class LazyewQuickWidgetProvider extends AppWidgetProvider {
+
+              @Override
+              public void onUpdate(Context context, AppWidgetManager appWidgetManager, int[] appWidgetIds) {
+                  for (int i = 0; i < appWidgetIds.length; i++) {
+                      RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.lazyew_quick_widget);
+
+                      Intent intent = new Intent(context, LazyewQuickAddActivity.class);
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+
+                      int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+                      if (Build.VERSION.SDK_INT >= 23) {
+                          flags = flags | PendingIntent.FLAG_IMMUTABLE;
+                      }
+                      PendingIntent pendingIntent = PendingIntent.getActivity(context, 0, intent, flags);
+                      views.setOnClickPendingIntent(R.id.lazyew_widget_root, pendingIntent);
+
+                      appWidgetManager.updateAppWidget(appWidgetIds[i], views);
+                  }
+              }
+          }
+          LAZYEW_EOF_3
+          cat > lazyew_patch/LazyewQuickAddActivity.java <<'LAZYEW_EOF_4'
+          package com.budget.tracker_app;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.DialogInterface;
+          import android.content.SharedPreferences;
+          import android.os.Bundle;
+          import android.view.KeyEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.view.inputmethod.EditorInfo;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          // Small popup (no app screen) used by the Lazyew quick add widget.
+          // It saves the typed text in a queue that the app imports the next time it
+          // opens. The app does the parsing (amount, account, category).
+          public class LazyewQuickAddActivity extends Activity {
+
+              private static final String PREFS = "FlutterSharedPreferences";
+              private static final String KEY = "flutter.lazyew_pending";
+
+              private AlertDialog dialog;
+              private EditText input;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  input = new EditText(this);
+                  input.setHint("2500 soda BAC");
+                  input.setSingleLine(true);
+                  input.setImeOptions(EditorInfo.IME_ACTION_DONE);
+
+                  float density = getResources().getDisplayMetrics().density;
+                  int pad = (int) (20 * density);
+                  FrameLayout container = new FrameLayout(this);
+                  container.setPadding(pad, pad / 2, pad, 0);
+                  container.addView(input, new FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.MATCH_PARENT,
+                          FrameLayout.LayoutParams.WRAP_CONTENT));
+
+                  dialog = new AlertDialog.Builder(this)
+                          .setTitle("Quick expense")
+                          .setMessage("Amount, description and optionally an account name.")
+                          .setView(container)
+                          .setPositiveButton("Add", null)
+                          .setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
+                              @Override
+                              public void onClick(DialogInterface d, int which) {
+                                  finish();
+                              }
+                          })
+                          .create();
+
+                  dialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
+                      @Override
+                      public void onCancel(DialogInterface d) {
+                          finish();
+                      }
+                  });
+
+                  if (dialog.getWindow() != null) {
+                      dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE);
+                  }
+                  dialog.show();
+
+                  dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          submit();
+                      }
+                  });
+
+                  input.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+                      @Override
+                      public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
+                          submit();
+                          return true;
+                      }
+                  });
+
+                  input.requestFocus();
+              }
+
+              private void submit() {
+                  String text = input.getText().toString().trim();
+                  if (text.length() == 0) {
+                      Toast.makeText(this, "Type an amount and a description", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  if (!text.matches(".*\\d.*")) {
+                      Toast.makeText(this, "Include an amount, e.g. 2500 soda", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  try {
+                      SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+                      String raw = prefs.getString(KEY, "[]");
+                      JSONArray array;
+                      try {
+                          array = new JSONArray(raw);
+                      } catch (Exception e) {
+                          array = new JSONArray();
+                      }
+                      JSONObject item = new JSONObject();
+                      item.put("text", text);
+                      item.put("time", System.currentTimeMillis());
+                      array.put(item);
+                      prefs.edit().putString(KEY, array.toString()).commit();
+                      Toast.makeText(this, "Saved: " + text + " (it appears in Lazyew when you open it)", Toast.LENGTH_LONG).show();
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Could not save the expense", Toast.LENGTH_LONG).show();
+                  }
+                  dialog.dismiss();
+                  finish();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (dialog != null && dialog.isShowing()) {
+                      dialog.dismiss();
+                  }
+                  super.onDestroy();
+              }
+          }
+          LAZYEW_EOF_4
+          cat > lazyew_patch/lazyew_quick_widget.xml <<'LAZYEW_EOF_5'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/lazyew_widget_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:layout_margin="6dp"
+              android:background="@drawable/lazyew_widget_bg"
+              android:padding="12dp">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_gravity="center_vertical|start"
+                  android:text="⚡  Quick add expense"
+                  android:textColor="@color/lazyew_widget_text"
+                  android:textSize="15sp"
+                  android:textStyle="bold" />
+          </FrameLayout>
+          LAZYEW_EOF_5
+          cat > lazyew_patch/lazyew_widget_bg.xml <<'LAZYEW_EOF_6'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <solid android:color="@color/lazyew_widget_bg" />
+              <corners android:radius="18dp" />
+          </shape>
+          LAZYEW_EOF_6
+          cat > lazyew_patch/lazyew_quick_widget_info.xml <<'LAZYEW_EOF_7'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="180dp"
+              android:minHeight="40dp"
+              android:targetCellWidth="3"
+              android:targetCellHeight="1"
+              android:updatePeriodMillis="0"
+              android:initialLayout="@layout/lazyew_quick_widget"
+              android:resizeMode="horizontal|vertical"
+              android:widgetCategory="home_screen">
+          </appwidget-provider>
+          LAZYEW_EOF_7
+          cat > lazyew_patch/lazyew_colors.xml <<'LAZYEW_EOF_8'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="lazyew_widget_bg">#F2F2F2</color>
+              <color name="lazyew_widget_text">#1C1C1C</color>
+          </resources>
+          LAZYEW_EOF_8
+          cat > lazyew_patch/lazyew_colors_night.xml <<'LAZYEW_EOF_9'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="lazyew_widget_bg">#2B2B2B</color>
+              <color name="lazyew_widget_text">#F2F2F2</color>
+          </resources>
+          LAZYEW_EOF_9
+          cat > lazyew_patch/apply_lazyew.py <<'LAZYEW_EOF_10'
           import os, shutil, sys
 
           SRC = os.path.dirname(os.path.abspath(__file__))
@@ -753,8 +1378,21 @@ jobs:
                   f.write(text.replace(old, new))
 
 
-          shutil.copy(os.path.join(SRC, "lazyewWallet.dart"), os.path.join(ROOT, "lib/struct/lazyewWallet.dart"))
-          shutil.copy(os.path.join(SRC, "lazyewPages.dart"), os.path.join(ROOT, "lib/pages/lazyewPages.dart"))
+          def put(src_name, dest_rel):
+              dest = os.path.join(ROOT, dest_rel)
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              shutil.copy(os.path.join(SRC, src_name), dest)
+
+
+          put("lazyewWallet.dart", "lib/struct/lazyewWallet.dart")
+          put("LazyewQuickWidgetProvider.java", "android/app/src/main/java/com/budget/tracker_app/LazyewQuickWidgetProvider.java")
+          put("LazyewQuickAddActivity.java", "android/app/src/main/java/com/budget/tracker_app/LazyewQuickAddActivity.java")
+          put("lazyew_quick_widget.xml", "android/app/src/main/res/layout/lazyew_quick_widget.xml")
+          put("lazyew_widget_bg.xml", "android/app/src/main/res/drawable/lazyew_widget_bg.xml")
+          put("lazyew_quick_widget_info.xml", "android/app/src/main/res/xml/lazyew_quick_widget_info.xml")
+          put("lazyew_colors.xml", "android/app/src/main/res/values/lazyew_colors.xml")
+          put("lazyew_colors_night.xml", "android/app/src/main/res/values-night/lazyew_colors.xml")
+          put("lazyewPages.dart", "lib/pages/lazyewPages.dart")
 
           # 1) Nombre de la app
           rep("android/app/src/main/AndroidManifest.xml", 'android:label="Cashew"', 'android:label="Lazyew"')
@@ -763,7 +1401,7 @@ jobs:
 
           # 2) Ajustes por defecto
           rep("lib/struct/defaultPreferences.dart", '"notificationScanning": false,',
-              '"notificationScanning": false,\n    "lazyewWalletCapture": true,\n    "lazyewQuickEntry": true,\n    "lazyewForkTag": true,\n    "lazyewNotifLog": [],')
+              '"notificationScanning": false,\n    "lazyewWalletCapture": true,\n    "lazyewQuickEntry": true,\n    "lazyewForkTag": true,\n    "lazyewCardMap": {},\n    "lazyewCardLabels": [],\n    "lazyewNotifLog": [],')
 
           # 3) Avisos y botones
           f = "lib/struct/initializeNotifications.dart"
@@ -790,7 +1428,7 @@ jobs:
           # 5) Recordatorio diario con botones
           rep("lib/widgets/notificationsSettings.dart",
               "    'Transaction Reminders',\n    importance: Importance.max,",
-              "    'Transaction Reminders',\n    actions: <AndroidNotificationAction>[\n      AndroidNotificationAction('lazyew_nothing', 'Nada hoy'),\n      AndroidNotificationAction('lazyew_register', 'Registrar',\n          showsUserInterface: true),\n    ],\n    importance: Importance.max,")
+              "    'Transaction Reminders',\n    actions: <AndroidNotificationAction>[\n      AndroidNotificationAction('lazyew_nothing', 'Nothing today'),\n      AndroidNotificationAction('lazyew_register', 'Register',\n          showsUserInterface: true),\n    ],\n    importance: Importance.max,")
 
           # 6) Ajustes: seccion nueva "Lazyew" y sin banner de donacion
           f = "lib/pages/settingsPage.dart"
@@ -822,8 +1460,19 @@ jobs:
           rep_all("lib/widgets/exportDB.dart", '"cashew-"', '"lazyew-"')
           rep_all("lib/widgets/exportCSV.dart", '"cashew-"', '"lazyew-"')
           rep_all("lib/widgets/importCSV.dart", '"cashew-import-template"', '"lazyew-import-template"')
+          # 10) Widget de gasto rapido (AndroidManifest)
+          rep("android/app/src/main/AndroidManifest.xml",
+              '        <receiver android:name="PlusWidgetProvider"',
+              '        <receiver android:name=".LazyewQuickWidgetProvider"\n            android:exported="true" android:label="Lazyew Quick Add">\n            <intent-filter>\n                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />\n            </intent-filter>\n            <meta-data android:name="android.appwidget.provider"\n                android:resource="@xml/lazyew_quick_widget_info" />\n        </receiver>\n        <activity android:name=".LazyewQuickAddActivity"\n            android:exported="false"\n            android:theme="@android:style/Theme.Translucent.NoTitleBar"\n            android:excludeFromRecents="true"\n            android:taskAffinity=""\n            android:windowSoftInputMode="stateVisible"\n            android:launchMode="singleTask" />\n        <receiver android:name="PlusWidgetProvider"')
+
+          # 11) Edit Home: interruptor del gasto rapido
+          f = "lib/pages/editHomePage.dart"
+          rep(f, "import 'package:budget/colors.dart';",
+              "import 'package:budget/colors.dart';\nimport 'package:budget/pages/lazyewPages.dart';")
+          rep(f, "          SliverReorderableList(\n            onReorderStart:",
+              "          SliverToBoxAdapter(child: LazyewEditHomeQuickAddRow()),\n          SliverReorderableList(\n            onReorderStart:")
           print("Lazyew aplicado correctamente")
-          LAZYEW_EOF_3
+          LAZYEW_EOF_10
           python3 lazyew_patch/apply_lazyew.py budget
 
       - name: Preparar la firma de la app
